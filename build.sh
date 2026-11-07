@@ -3,7 +3,7 @@
 set -e
 SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=13.0 -isysroot "$SDK" \
-  -dynamiclib -fobjc-arc -framework UIKit -framework Foundation \
+  -dynamiclib -fobjc-arc -framework UIKit -framework Foundation -framework CoreGraphics \
   -install_name @executable_path/Frameworks/AutoClicker.dylib \
   -o AutoClicker.dylib AutoClicker.m
 codesign -f -s - AutoClicker.dylib   # ad-hoc; your sideload tool re-signs it anyway
