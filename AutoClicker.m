@@ -208,7 +208,7 @@ static void TapPoints(NSArray<NSValue *> *points) {
 - (void)pan:(UIPanGestureRecognizer *)g {
     CGPoint d = [g translationInView:self.view];
     g.view.center = CGPointMake(g.view.center.x + d.x, g.view.center.y + d.y);
-    [g setTranslation:CGPointZero inView:self.view];
+    [g setTranslation:CGPointMake(0, 0) inView:self.view];
 }
 
 - (void)flip {
