@@ -4,6 +4,7 @@
 // UI:  floating "AC" button  -> tap = start/stop, drag = move
 //      gear button (or long-press AC) -> panel: click speed, clicks per tap,
 //      number of targets, mode (Sequential / Simultaneous), More... (jitter, delays)
+//      Presets… -> save / load / delete setups, optional auto-load when the game opens
 //      red numbered crosshairs -> drag each one onto its target
 //
 // Sequential:   each tick taps target 1, 2, 3... with a small gap between them.
@@ -202,6 +203,10 @@ static void TapPoints(NSArray<NSValue *> *points) {
 }
 @end
 
+static NSString *const kPresetsKey  = @"AutoClickerPresets";
+static NSString *const kAutoLoadKey = @"AutoClickerAutoLoad";
+#define kPanelH 276
+
 static const double kCPS[] = {0.5, 1, 2, 3, 5, 8, 10, 15, 20, 30, 50};
 #define kCPSCount ((NSInteger)(sizeof(kCPS) / sizeof(kCPS[0])))
 
@@ -263,6 +268,17 @@ static ACController *gCtl;
     [self buildPanel];
     [self layoutDock];
     [self refreshUI];
+
+    NSString *autoName = [[NSUserDefaults standardUserDefaults] stringForKey:kAutoLoadKey];
+    if (autoName.length) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            NSDictionary *all = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kPresetsKey];
+            NSDictionary *p = all[autoName];
+            if ([p isKindOfClass:[NSDictionary class]] && [self applyPreset:p])
+                [self toast:[NSString stringWithFormat:@"Loaded preset: %@", autoName]];
+        });
+    }
 }
 
 // ----- panel -----
@@ -302,7 +318,7 @@ static ACController *gCtl;
 }
 
 - (void)buildPanel {
-    self.panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 254, 232)];
+    self.panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 254, kPanelH)];
     self.panel.backgroundColor = [UIColor colorWithWhite:0 alpha:0.78];
     self.panel.layer.cornerRadius = 14;
     self.panel.hidden = YES;
@@ -316,8 +332,13 @@ static ACController *gCtl;
     self.modeButton.titleLabel.font = [UIFont boldSystemFontOfSize:15];
     [self.panel addSubview:self.modeButton];
 
+    UIButton *presets = [self smallButton:@"Presets… (save / load)" action:@selector(openPresets)];
+    presets.frame = CGRectMake(12, 188, 230, 34);
+    presets.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+    [self.panel addSubview:presets];
+
     UIButton *more = [self smallButton:@"More… (jitter, delays)" action:@selector(openMore)];
-    more.frame = CGRectMake(12, 188, 230, 34);
+    more.frame = CGRectMake(12, 232, 230, 34);
     more.titleLabel.font = [UIFont boldSystemFontOfSize:15];
     [self.panel addSubview:more];
 
@@ -329,7 +350,7 @@ static ACController *gCtl;
     CGFloat gx = CGRectGetMaxX(self.toggle.frame) + 26;
     if (gx + 22 > v.width) gx = CGRectGetMinX(self.toggle.frame) - 26;
     self.gear.center = CGPointMake(gx, self.toggle.center.y);
-    CGFloat pw = 254, ph = 232;
+    CGFloat pw = 254, ph = kPanelH;
     CGFloat x = MAX(8, MIN(self.toggle.frame.origin.x, v.width - pw - 8));
     CGFloat y = CGRectGetMaxY(self.toggle.frame) + 8;
     if (y + ph > v.height - 8) y = MAX(8, self.toggle.frame.origin.y - ph - 8);
@@ -484,6 +505,180 @@ static void RunAfter(NSTimeInterval delay, NSArray<NSValue *> *pts) {
 
 - (void)restartIfRunning {
     if (self.running) { [self flip]; [self flip]; }
+}
+
+// ----- presets (saved in the game's own NSUserDefaults) -----
+- (CGSize)viewSize {
+    CGSize vs = self.view.bounds.size;
+    if (vs.width < 100) vs = [UIScreen mainScreen].bounds.size;
+    return vs;
+}
+
+- (void)toast:(NSString *)text {
+    UILabel *l = [[UILabel alloc] init];
+    l.text = [NSString stringWithFormat:@"  %@  ", text];
+    l.textColor = UIColor.whiteColor;
+    l.font = [UIFont boldSystemFontOfSize:14];
+    l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.8];
+    l.layer.cornerRadius = 15;
+    l.clipsToBounds = YES;
+    l.textAlignment = NSTextAlignmentCenter;
+    [l sizeToFit];
+    l.frame = CGRectMake(0, 0, l.frame.size.width + 10, 30);
+    l.center = CGPointMake([self viewSize].width / 2, 70);
+    [self.view addSubview:l];
+    [UIView animateWithDuration:0.4 delay:1.6 options:0 animations:^{ l.alpha = 0; }
+                     completion:^(BOOL done) { [l removeFromSuperview]; }];
+}
+
+- (NSDictionary *)currentPreset {
+    CGSize vs = [self viewSize];
+    NSMutableArray *pts = [NSMutableArray array];
+    for (UILabel *t in self.targets)   // stored as screen fractions so they survive rotation / other devices
+        [pts addObject:@[@(t.center.x / vs.width), @(t.center.y / vs.height)]];
+    return @{ @"targets": pts,
+              @"interval": @(self.interval),
+              @"burst": @(self.burst),
+              @"jitter": @(self.jitter),
+              @"gap": @(self.gap),
+              @"burstGap": @(self.burstGap),
+              @"simultaneous": @(self.simultaneous) };
+}
+
+- (BOOL)applyPreset:(NSDictionary *)p {
+    NSArray *pts = p[@"targets"];
+    if (![pts isKindOfClass:[NSArray class]] || pts.count == 0) return NO;
+    NSUInteger n = MIN((NSUInteger)10, pts.count);
+    while (self.targets.count > n) [self removeTarget];
+    while (self.targets.count < n) [self addTarget];
+
+    CGSize vs = [self viewSize];
+    for (NSUInteger i = 0; i < n; i++) {
+        NSArray *xy = pts[i];
+        if (![xy isKindOfClass:[NSArray class]] || xy.count < 2) continue;
+        UILabel *t = self.targets[i];
+        CGFloat hw = t.bounds.size.width / 2, hh = t.bounds.size.height / 2;
+        CGFloat x = MAX(hw, MIN(vs.width - hw, [xy[0] doubleValue] * vs.width));
+        CGFloat y = MAX(hh, MIN(vs.height - hh, [xy[1] doubleValue] * vs.height));
+        t.center = CGPointMake(x, y);
+    }
+    double iv = [p[@"interval"] doubleValue];
+    if (iv > 0) self.interval = MIN(10.0, MAX(0.02, iv));
+    self.burst = MIN(10, MAX(1, [p[@"burst"] integerValue]));
+    self.jitter = MAX(0, [p[@"jitter"] integerValue]);
+    self.gap = MAX(0.0, [p[@"gap"] doubleValue]);
+    double bg = [p[@"burstGap"] doubleValue];
+    self.burstGap = bg > 0 ? MAX(0.01, bg) : 0.06;
+    self.simultaneous = [p[@"simultaneous"] boolValue];
+    [self restartIfRunning];
+    [self refreshUI];
+    return YES;
+}
+
+- (NSDictionary *)allPresets {
+    NSDictionary *d = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kPresetsKey];
+    return d ?: @{};
+}
+
+- (NSArray<NSString *> *)presetNames {
+    return [[self allPresets].allKeys sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+}
+
+// Presents an alert on the next run-loop turn so it works when called from another alert's handler.
+- (void)present:(UIAlertController *)a {
+    dispatch_async(dispatch_get_main_queue(), ^{ [self presentViewController:a animated:YES completion:nil]; });
+}
+
+- (void)openPresets {
+    NSArray *names = [self presetNames];
+    NSString *autoName = [[NSUserDefaults standardUserDefaults] stringForKey:kAutoLoadKey];
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Presets"
+        message:(names.count ? @"Tap a preset to load it. ★ = loads automatically when the game opens."
+                             : @"No presets saved yet. Set up your targets and speed, then save.")
+        preferredStyle:UIAlertControllerStyleAlert];
+    for (NSString *name in names) {
+        NSString *title = [name isEqualToString:autoName] ? [name stringByAppendingString:@" ★"] : name;
+        [a addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+            NSDictionary *p = [self allPresets][name];
+            if ([p isKindOfClass:[NSDictionary class]] && [self applyPreset:p])
+                [self toast:[NSString stringWithFormat:@"Loaded preset: %@", name]];
+            else
+                [self toast:@"Could not load preset"];
+        }]];
+    }
+    [a addAction:[UIAlertAction actionWithTitle:@"Save current as…" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+        [self promptSave];
+    }]];
+    if (names.count) {
+        [a addAction:[UIAlertAction actionWithTitle:@"Auto-load on launch…" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+            [self promptAutoLoad];
+        }]];
+        [a addAction:[UIAlertAction actionWithTitle:@"Delete a preset…" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) {
+            [self promptDelete];
+        }]];
+    }
+    [a addAction:[UIAlertAction actionWithTitle:@"Close" style:UIAlertActionStyleCancel handler:nil]];
+    [self present:a];
+}
+
+- (void)promptSave {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Save preset"
+        message:@"Saves target positions, speed, clicks per tap, mode, jitter and delays. Using an existing name overwrites it."
+        preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"preset name";
+        tf.autocapitalizationType = UITextAutocapitalizationTypeSentences;
+    }];
+    [a addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+        NSString *name = [a.textFields[0].text stringByTrimmingCharactersInSet:
+                          [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (!name.length) name = [NSString stringWithFormat:@"Preset %lu", (unsigned long)([self allPresets].count + 1)];
+        NSMutableDictionary *all = [[self allPresets] mutableCopy];
+        all[name] = [self currentPreset];
+        [[NSUserDefaults standardUserDefaults] setObject:all forKey:kPresetsKey];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+        [self toast:[NSString stringWithFormat:@"Saved preset: %@", name]];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [self present:a];
+}
+
+- (void)promptDelete {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Delete which preset?" message:nil
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    for (NSString *name in [self presetNames]) {
+        [a addAction:[UIAlertAction actionWithTitle:name style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) {
+            NSMutableDictionary *all = [[self allPresets] mutableCopy];
+            [all removeObjectForKey:name];
+            NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+            [ud setObject:all forKey:kPresetsKey];
+            if ([[ud stringForKey:kAutoLoadKey] isEqualToString:name]) [ud removeObjectForKey:kAutoLoadKey];
+            [ud synchronize];
+            [self toast:[NSString stringWithFormat:@"Deleted preset: %@", name]];
+        }]];
+    }
+    [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [self present:a];
+}
+
+- (void)promptAutoLoad {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Auto-load on launch"
+        message:@"This preset is applied automatically a moment after the game opens."
+        preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"Off" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+        [[NSUserDefaults standardUserDefaults] removeObjectForKey:kAutoLoadKey];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+        [self toast:@"Auto-load: off"];
+    }]];
+    for (NSString *name in [self presetNames]) {
+        [a addAction:[UIAlertAction actionWithTitle:name style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+            [[NSUserDefaults standardUserDefaults] setObject:name forKey:kAutoLoadKey];
+            [[NSUserDefaults standardUserDefaults] synchronize];
+            [self toast:[NSString stringWithFormat:@"Auto-load: %@", name]];
+        }]];
+    }
+    [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [self present:a];
 }
 
 - (void)openMore {
