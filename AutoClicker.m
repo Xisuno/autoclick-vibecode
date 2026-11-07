@@ -389,8 +389,10 @@ static ACController *gCtl;
     c.textAlignment = NSTextAlignmentCenter;
     c.textColor = UIColor.redColor;
     c.userInteractionEnabled = YES;
-    CGFloat off = self.targets.count * 40;
-    c.center = CGPointMake(self.view.bounds.size.width / 2 + off, self.view.bounds.size.height / 2 + off);
+    // Every new target spawns at the center of the screen; drag it where you want it.
+    CGSize vs = self.view.bounds.size;
+    if (vs.width < 100) vs = [UIScreen mainScreen].bounds.size;
+    c.center = CGPointMake(vs.width / 2, vs.height / 2);
     [c addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(pan:)]];
     if (self.toggle) [self.view insertSubview:c belowSubview:self.toggle];
     else [self.view addSubview:c];
@@ -412,7 +414,11 @@ static ACController *gCtl;
 
 - (void)pan:(UIPanGestureRecognizer *)g {
     CGPoint d = [g translationInView:self.view];
-    g.view.center = CGPointMake(g.view.center.x + d.x, g.view.center.y + d.y);
+    CGSize vs = self.view.bounds.size;
+    CGFloat hw = g.view.bounds.size.width / 2, hh = g.view.bounds.size.height / 2;
+    CGFloat nx = MAX(hw, MIN(vs.width - hw, g.view.center.x + d.x));   // keep fully on screen
+    CGFloat ny = MAX(hh, MIN(vs.height - hh, g.view.center.y + d.y));
+    g.view.center = CGPointMake(nx, ny);
     [g setTranslation:CGPointMake(0, 0) inView:self.view];
     if (g.view == self.toggle) [self layoutDock];
 }
