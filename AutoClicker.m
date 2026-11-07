@@ -85,6 +85,41 @@ static UIWindow *TargetWindow(void) {
     return best;
 }
 
+// iOS 16 has no -_setLocationInWindow:resetPrevLocation: on UITouch (or it was renamed),
+// so fall back to writing UITouch's own location ivars directly.
+static NSString *LocationMethodsHint(void) {
+    unsigned int n = 0;
+    Method *ms = class_copyMethodList([UITouch class], &n);
+    NSMutableArray *a = [NSMutableArray array];
+    for (unsigned int i = 0; i < n; i++) {
+        NSString *nm = NSStringFromSelector(method_getName(ms[i]));
+        if ([nm.lowercaseString containsString:@"location"]) [a addObject:nm];
+    }
+    free(ms);
+    return a.count ? [a componentsJoinedByString:@", "] : @"(none)";
+}
+
+static BOOL SetTouchLocation(UITouch *t, CGPoint p, BOOL reset) {
+    SEL sel = @selector(_setLocationInWindow:resetPrevLocation:);
+    if ([t respondsToSelector:sel]) {
+        [t _setLocationInWindow:p resetPrevLocation:reset];
+        return YES;
+    }
+    Ivar cur = class_getInstanceVariable([UITouch class], "_locationInWindow");
+    Ivar prev = class_getInstanceVariable([UITouch class], "_previousLocationInWindow");
+    if (!cur) return NO;
+    const char *enc = ivar_getTypeEncoding(cur);
+    if (!enc || strncmp(enc, "{CGPoint", 8) != 0) return NO;
+    uint8_t *base = (uint8_t *)(__bridge void *)t;
+    CGPoint *pc = (CGPoint *)(base + ivar_getOffset(cur));
+    if (prev) {
+        CGPoint *pp = (CGPoint *)(base + ivar_getOffset(prev));
+        *pp = reset ? p : *pc;
+    }
+    *pc = p;
+    return YES;
+}
+
 // Returns nil on success, or a short description of what went wrong.
 #define NEED(obj, sel) if (![(obj) respondsToSelector:@selector(sel)]) { \
     return [NSString stringWithFormat:@"missing -[%@ %s]", NSStringFromClass([(obj) class]), #sel]; }
@@ -110,7 +145,6 @@ static NSString *SendTouches(UIWindow *win, NSArray<NSValue *> *points, NSArray<
             NEED(t, setWindow:)
             NEED(t, setView:)
             NEED(t, setPhase:)
-            NEED(t, _setLocationInWindow:resetPrevLocation:)
             UIView *view = [win hitTest:pts[i] withEvent:nil] ?: win;
             [t setWindow:win];
             [t setView:view];
@@ -118,7 +152,9 @@ static NSString *SendTouches(UIWindow *win, NSArray<NSValue *> *points, NSArray<
             [t setPhase:phase];
             if ([t respondsToSelector:@selector(setTimestamp:)])
                 [t setTimestamp:[[NSProcessInfo processInfo] systemUptime]];
-            [t _setLocationInWindow:pts[i] resetPrevLocation:(phase == UITouchPhaseBegan)];
+            if (!SetTouchLocation(t, pts[i], phase == UITouchPhaseBegan))
+                return [NSString stringWithFormat:@"cannot set touch location. UITouch location methods: %@",
+                        LocationMethodsHint()];
             if (phase == UITouchPhaseBegan && [t respondsToSelector:@selector(_setIsFirstTouchForView:)])
                 [t _setIsFirstTouchForView:YES];
 
