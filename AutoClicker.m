@@ -85,43 +85,61 @@ static UIWindow *TargetWindow(void) {
     return best;
 }
 
-// Sends one UIEvent carrying N touches (N == 1 is a plain tap, N > 1 is true multi-touch).
-static void SendTouches(UIWindow *win, NSArray<NSValue *> *points, NSArray<UITouch *> *touches,
-                        UITouchPhase phase) {
-    UIApplication *app = [UIApplication sharedApplication];
-    NSUInteger n = points.count;
-    CGPoint pts[n];
-    for (NSUInteger i = 0; i < n; i++) pts[i] = points[i].CGPointValue;
-    BOOL down = (phase != UITouchPhaseEnded);
+// Returns nil on success, or a short description of what went wrong.
+#define NEED(obj, sel) if (![(obj) respondsToSelector:@selector(sel)]) { \
+    return [NSString stringWithFormat:@"missing -[%@ %s]", NSStringFromClass([(obj) class]), #sel]; }
 
-    UIEvent *ev = [app _touchesEvent];
-    [ev _clearTouches];
+static NSString *SendTouches(UIWindow *win, NSArray<NSValue *> *points, NSArray<UITouch *> *touches,
+                             UITouchPhase phase) {
+    @try {
+        UIApplication *app = [UIApplication sharedApplication];
+        NSUInteger n = points.count;
+        CGPoint pts[n];
+        for (NSUInteger i = 0; i < n; i++) pts[i] = points[i].CGPointValue;
+        BOOL down = (phase != UITouchPhaseEnded);
 
-    for (NSUInteger i = 0; i < n; i++) {
-        UITouch *t = touches[i];
-        UIView *view = [win hitTest:pts[i] withEvent:nil] ?: win;
-        [t setWindow:win];
-        [t setView:view];
-        [t setTapCount:1];
-        [t setPhase:phase];
-        [t setTimestamp:[[NSProcessInfo processInfo] systemUptime]];
-        [t _setLocationInWindow:pts[i] resetPrevLocation:(phase == UITouchPhaseBegan)];
-        if (phase == UITouchPhaseBegan) [t _setIsFirstTouchForView:YES];
+        NEED(app, _touchesEvent)
+        UIEvent *ev = [app _touchesEvent];
+        if (!ev) return @"_touchesEvent returned nil";
+        NEED(ev, _clearTouches)
+        NEED(ev, _addTouch:forDelayedDelivery:)
+        [ev _clearTouches];
 
-        // Each touch gets its own single-finger HID event.
-        IOHIDEventRef one = MakeHID(&pts[i], 1, down);
-        if (one && [t respondsToSelector:@selector(_setHidEvent:)]) [t _setHidEvent:one];
-        if (one) CFRelease(one);
+        for (NSUInteger i = 0; i < n; i++) {
+            UITouch *t = touches[i];
+            NEED(t, setWindow:)
+            NEED(t, setView:)
+            NEED(t, setPhase:)
+            NEED(t, _setLocationInWindow:resetPrevLocation:)
+            UIView *view = [win hitTest:pts[i] withEvent:nil] ?: win;
+            [t setWindow:win];
+            [t setView:view];
+            if ([t respondsToSelector:@selector(setTapCount:)]) [t setTapCount:1];
+            [t setPhase:phase];
+            if ([t respondsToSelector:@selector(setTimestamp:)])
+                [t setTimestamp:[[NSProcessInfo processInfo] systemUptime]];
+            [t _setLocationInWindow:pts[i] resetPrevLocation:(phase == UITouchPhaseBegan)];
+            if (phase == UITouchPhaseBegan && [t respondsToSelector:@selector(_setIsFirstTouchForView:)])
+                [t _setIsFirstTouchForView:YES];
 
-        [ev _addTouch:t forDelayedDelivery:NO];
+            IOHIDEventRef one = MakeHID(&pts[i], 1, down);
+            if (one && [t respondsToSelector:@selector(_setHidEvent:)]) [t _setHidEvent:one];
+            if (one) CFRelease(one);
+
+            [ev _addTouch:t forDelayedDelivery:NO];
+        }
+
+        IOHIDEventRef all = MakeHID(pts, n, down);
+        if (all && [ev respondsToSelector:@selector(_setHIDEvent:)]) [ev _setHIDEvent:all];
+        [app sendEvent:ev];
+        if (all) CFRelease(all);
+        return nil;
+    } @catch (NSException *e) {
+        return [NSString stringWithFormat:@"%@: %@", e.name, e.reason];
     }
-
-    // The event itself carries the combined multi-finger HID event.
-    IOHIDEventRef all = MakeHID(pts, n, down);
-    if (all && [ev respondsToSelector:@selector(_setHIDEvent:)]) [ev _setHIDEvent:all];
-    [app sendEvent:ev];
-    if (all) CFRelease(all);
 }
+
+static void ReportError(NSString *err);
 
 // Tap = began, then ended 30ms later, for the given set of points (1 or many at once).
 static void TapPoints(NSArray<NSValue *> *points) {
@@ -129,10 +147,12 @@ static void TapPoints(NSArray<NSValue *> *points) {
     if (!win || points.count == 0) return;
     NSMutableArray *touches = [NSMutableArray array];
     for (NSUInteger i = 0; i < points.count; i++) [touches addObject:[[UITouch alloc] init]];
-    SendTouches(win, points, touches, UITouchPhaseBegan);
+    NSString *err = SendTouches(win, points, touches, UITouchPhaseBegan);
+    if (err) { ReportError(err); return; }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.03 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        SendTouches(win, points, touches, UITouchPhaseEnded);
+        NSString *e2 = SendTouches(win, points, touches, UITouchPhaseEnded);
+        if (e2) ReportError(e2);
     });
 }
 
@@ -157,11 +177,14 @@ static void TapPoints(NSArray<NSValue *> *points) {
 @property (nonatomic) BOOL running;
 @end
 
+static ACController *gCtl;
+
 @implementation ACController
 
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.view.backgroundColor = UIColor.clearColor;
+    gCtl = self;
     self.interval = 0.1;
     self.gap = 0.01;
     self.targets = [NSMutableArray array];
@@ -248,6 +271,17 @@ static void TapPoints(NSArray<NSValue *> *points) {
     }
 }
 
+- (void)failWith:(NSString *)err {
+    if (self.running) [self flip];   // stop the clicker
+    if (self.presentedViewController) return;
+    UIAlertController *al = [UIAlertController alertControllerWithTitle:@"Auto Clicker stopped"
+        message:[NSString stringWithFormat:@"%@\n\n(iOS %@) Send a screenshot of this.", err,
+                 [UIDevice currentDevice].systemVersion]
+        preferredStyle:UIAlertControllerStyleAlert];
+    [al addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:al animated:YES completion:nil];
+}
+
 - (void)restartIfRunning {
     if (self.running) { [self flip]; [self flip]; }
 }
@@ -292,6 +326,10 @@ static void TapPoints(NSArray<NSValue *> *points) {
     [self presentViewController:a animated:YES completion:nil];
 }
 @end
+
+static void ReportError(NSString *err) {
+    dispatch_async(dispatch_get_main_queue(), ^{ [gCtl failWith:err]; });
+}
 
 static ACWindow *gWin;
 
