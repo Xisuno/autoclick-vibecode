@@ -1,10 +1,10 @@
 // AutoClicker.m - in-process multi-target auto tapper for sideloaded (jailed) apps.
 // Inject as a dylib (iGameGod / Sideloadly / ESign / TrollStore etc). No jailbreak needed.
 //
-// UI:  floating "AC" button  -> tap = start/stop, long-press = settings
+// UI:  floating "AC" button  -> tap = start/stop, drag = move
+//      gear button (or long-press AC) -> panel: click speed, clicks per tap,
+//      number of targets, mode (Sequential / Simultaneous), More... (jitter, delays)
 //      red numbered crosshairs -> drag each one onto its target
-// Settings (long-press AC): interval, jitter, gap between sequential taps,
-//      Add target, Remove target, Mode (Sequential <-> Simultaneous).
 //
 // Sequential:   each tick taps target 1, 2, 3... with a small gap between them.
 // Simultaneous: each tick sends ALL targets as one multi-touch event (like several fingers).
@@ -202,13 +202,24 @@ static void TapPoints(NSArray<NSValue *> *points) {
 }
 @end
 
+static const double kCPS[] = {0.5, 1, 2, 3, 5, 8, 10, 15, 20, 30, 50};
+#define kCPSCount ((NSInteger)(sizeof(kCPS) / sizeof(kCPS[0])))
+
 @interface ACController : UIViewController
 @property (nonatomic, strong) UIButton *toggle;
+@property (nonatomic, strong) UIButton *gear;
+@property (nonatomic, strong) UIView *panel;
+@property (nonatomic, strong) UILabel *speedLabel;
+@property (nonatomic, strong) UILabel *burstLabel;
+@property (nonatomic, strong) UILabel *targetLabel;
+@property (nonatomic, strong) UIButton *modeButton;
 @property (nonatomic, strong) NSMutableArray<UILabel *> *targets;
 @property (nonatomic, strong) NSTimer *timer;
-@property (nonatomic) NSTimeInterval interval;
-@property (nonatomic) NSTimeInterval gap;      // delay between taps in sequential mode
-@property (nonatomic) NSInteger jitter;        // px
+@property (nonatomic) NSTimeInterval interval;   // seconds between ticks (1 / clicks-per-second)
+@property (nonatomic) NSTimeInterval gap;        // delay between targets in sequential mode
+@property (nonatomic) NSTimeInterval burstGap;   // max delay between the clicks of one burst
+@property (nonatomic) NSInteger burst;           // clicks per target per tick (1-10)
+@property (nonatomic) NSInteger jitter;          // px
 @property (nonatomic) BOOL simultaneous;
 @property (nonatomic) BOOL running;
 @end
@@ -219,10 +230,12 @@ static ACController *gCtl;
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.view.backgroundColor = UIColor.clearColor;
     gCtl = self;
+    self.view.backgroundColor = UIColor.clearColor;
     self.interval = 0.1;
     self.gap = 0.01;
+    self.burstGap = 0.06;
+    self.burst = 1;
     self.targets = [NSMutableArray array];
     [self addTarget];
 
@@ -234,10 +247,142 @@ static ACController *gCtl;
     [self.toggle setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
     [self.toggle addTarget:self action:@selector(flip) forControlEvents:UIControlEventTouchUpInside];
     [self.toggle addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(pan:)]];
-    [self.toggle addGestureRecognizer:[[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(settings:)]];
+    [self.toggle addGestureRecognizer:[[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(longPress:)]];
     [self.view addSubview:self.toggle];
+
+    self.gear = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.gear.frame = CGRectMake(0, 0, 40, 40);
+    self.gear.layer.cornerRadius = 20;
+    self.gear.backgroundColor = [UIColor colorWithWhite:0 alpha:0.6];
+    [self.gear setTitle:@"⚙" forState:UIControlStateNormal];
+    [self.gear setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    self.gear.titleLabel.font = [UIFont systemFontOfSize:20];
+    [self.gear addTarget:self action:@selector(togglePanel) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.gear];
+
+    [self buildPanel];
+    [self layoutDock];
+    [self refreshUI];
 }
 
+// ----- panel -----
+- (UIButton *)smallButton:(NSString *)title action:(SEL)action {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.frame = CGRectMake(0, 0, 40, 34);
+    b.backgroundColor = [UIColor colorWithWhite:1 alpha:0.18];
+    b.layer.cornerRadius = 8;
+    [b setTitle:title forState:UIControlStateNormal];
+    [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    b.titleLabel.font = [UIFont boldSystemFontOfSize:20];
+    [b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
+- (UILabel *)textLabel:(NSString *)text frame:(CGRect)f align:(NSTextAlignment)a {
+    UILabel *l = [[UILabel alloc] initWithFrame:f];
+    l.text = text;
+    l.textColor = UIColor.whiteColor;
+    l.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+    l.textAlignment = a;
+    return l;
+}
+
+- (UILabel *)addRow:(NSString *)title y:(CGFloat)y minus:(SEL)minus plus:(SEL)plus {
+    [self.panel addSubview:[self textLabel:title frame:CGRectMake(12, y, 92, 34) align:NSTextAlignmentLeft]];
+    UIButton *m = [self smallButton:@"−" action:minus];
+    m.frame = CGRectMake(104, y, 40, 34);
+    [self.panel addSubview:m];
+    UILabel *v = [self textLabel:@"" frame:CGRectMake(146, y, 54, 34) align:NSTextAlignmentCenter];
+    v.font = [UIFont monospacedDigitSystemFontOfSize:15 weight:UIFontWeightBold];
+    [self.panel addSubview:v];
+    UIButton *p = [self smallButton:@"+" action:plus];
+    p.frame = CGRectMake(202, y, 40, 34);
+    [self.panel addSubview:p];
+    return v;
+}
+
+- (void)buildPanel {
+    self.panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 254, 232)];
+    self.panel.backgroundColor = [UIColor colorWithWhite:0 alpha:0.78];
+    self.panel.layer.cornerRadius = 14;
+    self.panel.hidden = YES;
+
+    self.speedLabel  = [self addRow:@"Click speed" y:12  minus:@selector(speedDown) plus:@selector(speedUp)];
+    self.burstLabel  = [self addRow:@"Clicks / tap" y:56  minus:@selector(burstDown) plus:@selector(burstUp)];
+    self.targetLabel = [self addRow:@"Targets"      y:100 minus:@selector(targetDown) plus:@selector(targetUp)];
+
+    self.modeButton = [self smallButton:@"" action:@selector(toggleMode)];
+    self.modeButton.frame = CGRectMake(12, 144, 230, 34);
+    self.modeButton.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+    [self.panel addSubview:self.modeButton];
+
+    UIButton *more = [self smallButton:@"More… (jitter, delays)" action:@selector(openMore)];
+    more.frame = CGRectMake(12, 188, 230, 34);
+    more.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+    [self.panel addSubview:more];
+
+    [self.view addSubview:self.panel];
+}
+
+- (void)layoutDock {
+    CGSize v = self.view.bounds.size;
+    CGFloat gx = CGRectGetMaxX(self.toggle.frame) + 26;
+    if (gx + 22 > v.width) gx = CGRectGetMinX(self.toggle.frame) - 26;
+    self.gear.center = CGPointMake(gx, self.toggle.center.y);
+    CGFloat pw = 254, ph = 232;
+    CGFloat x = MAX(8, MIN(self.toggle.frame.origin.x, v.width - pw - 8));
+    CGFloat y = CGRectGetMaxY(self.toggle.frame) + 8;
+    if (y + ph > v.height - 8) y = MAX(8, self.toggle.frame.origin.y - ph - 8);
+    self.panel.frame = CGRectMake(x, y, pw, ph);
+}
+
+- (void)refreshUI {
+    self.speedLabel.text = [NSString stringWithFormat:@"%.3g/s", 1.0 / self.interval];
+    self.burstLabel.text = [NSString stringWithFormat:@"x%ld", (long)self.burst];
+    self.targetLabel.text = [NSString stringWithFormat:@"%lu", (unsigned long)self.targets.count];
+    [self.modeButton setTitle:(self.simultaneous ? @"Mode: Simultaneous (tap to switch)"
+                                                 : @"Mode: Sequential (tap to switch)")
+                     forState:UIControlStateNormal];
+}
+
+- (void)togglePanel {
+    self.panel.hidden = !self.panel.hidden;
+    if (!self.panel.hidden) { [self layoutDock]; [self refreshUI]; }
+}
+
+- (void)longPress:(UILongPressGestureRecognizer *)g {
+    if (g.state == UIGestureRecognizerStateBegan) [self togglePanel];
+}
+
+// ----- panel actions -----
+- (void)stepSpeed:(int)dir {
+    double cps = 1.0 / self.interval;
+    if (dir > 0 && cps >= kCPS[kCPSCount - 1]) return;
+    if (dir < 0 && cps <= kCPS[0]) return;
+    double next = cps;
+    if (dir > 0) {
+        for (NSInteger i = 0; i < kCPSCount; i++)
+            if (kCPS[i] > cps * 1.001) { next = kCPS[i]; break; }
+    } else {
+        for (NSInteger i = kCPSCount - 1; i >= 0; i--)
+            if (kCPS[i] < cps * 0.999) { next = kCPS[i]; break; }
+    }
+    self.interval = 1.0 / next;
+    [self restartIfRunning];
+    [self refreshUI];
+}
+- (void)speedUp   { [self stepSpeed:+1]; }
+- (void)speedDown { [self stepSpeed:-1]; }
+
+- (void)burstUp   { if (self.burst < 10) self.burst++; [self refreshUI]; }
+- (void)burstDown { if (self.burst > 1)  self.burst--; [self refreshUI]; }
+
+- (void)targetUp   { if (self.targets.count < 10) [self addTarget]; [self refreshUI]; }
+- (void)targetDown { [self removeTarget]; [self refreshUI]; }
+
+- (void)toggleMode { self.simultaneous = !self.simultaneous; [self refreshUI]; }
+
+// ----- targets -----
 - (void)addTarget {
     UILabel *c = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 56, 44)];
     c.font = [UIFont boldSystemFontOfSize:26];
@@ -247,7 +392,8 @@ static ACController *gCtl;
     CGFloat off = self.targets.count * 40;
     c.center = CGPointMake(self.view.bounds.size.width / 2 + off, self.view.bounds.size.height / 2 + off);
     [c addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(pan:)]];
-    [self.view addSubview:c];
+    if (self.toggle) [self.view insertSubview:c belowSubview:self.toggle];
+    else [self.view addSubview:c];
     [self.targets addObject:c];
     [self relabel];
 }
@@ -268,8 +414,10 @@ static ACController *gCtl;
     CGPoint d = [g translationInView:self.view];
     g.view.center = CGPointMake(g.view.center.x + d.x, g.view.center.y + d.y);
     [g setTranslation:CGPointMake(0, 0) inView:self.view];
+    if (g.view == self.toggle) [self layoutDock];
 }
 
+// ----- running -----
 - (void)flip {
     self.running = !self.running;
     self.toggle.backgroundColor = self.running ? [UIColor colorWithRed:0.1 green:0.6 blue:0.2 alpha:0.85]
@@ -291,18 +439,28 @@ static ACController *gCtl;
     return p;
 }
 
-- (void)fire {
-    NSMutableArray<NSValue *> *pts = [NSMutableArray array];
-    for (UILabel *t in self.targets)
-        [pts addObject:[NSValue valueWithCGPoint:[self jittered:t.center]]];
+static void RunAfter(NSTimeInterval delay, NSArray<NSValue *> *pts) {
+    if (delay <= 0.0005) { TapPoints(pts); return; }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ TapPoints(pts); });
+}
 
-    if (self.simultaneous) {
-        TapPoints(pts); // all fingers in one event
-    } else {
-        for (NSUInteger i = 0; i < pts.count; i++) {
-            NSValue *p = pts[i];
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * self.gap * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{ TapPoints(@[p]); });
+- (void)fire {
+    NSInteger n = MAX(1, self.burst);
+    // Keep a whole burst inside one tick so bursts never pile up.
+    NSTimeInterval bg = (n > 1) ? MAX(0.01, MIN(self.burstGap, self.interval / n)) : 0;
+
+    for (NSInteger b = 0; b < n; b++) {
+        NSTimeInterval base = b * bg;
+        NSMutableArray<NSValue *> *pts = [NSMutableArray array];
+        for (UILabel *t in self.targets)
+            [pts addObject:[NSValue valueWithCGPoint:[self jittered:t.center]]];
+
+        if (self.simultaneous) {
+            RunAfter(base, pts); // all targets in one multi-touch event
+        } else {
+            for (NSUInteger i = 0; i < pts.count; i++)
+                RunAfter(base + i * self.gap, @[pts[i]]);
         }
     }
 }
@@ -322,41 +480,34 @@ static ACController *gCtl;
     if (self.running) { [self flip]; [self flip]; }
 }
 
-- (void)settings:(UILongPressGestureRecognizer *)g {
-    if (g.state != UIGestureRecognizerStateBegan) return;
-    NSString *msg = [NSString stringWithFormat:@"%lu target(s), mode: %@",
-                     (unsigned long)self.targets.count,
-                     self.simultaneous ? @"Simultaneous" : @"Sequential"];
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Auto Clicker"
-                                                               message:msg
+- (void)openMore {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"More settings"
+                                                               message:@"Exact values (the panel buttons use presets)"
                                                         preferredStyle:UIAlertControllerStyleAlert];
     [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.placeholder = @"interval (s)"; tf.keyboardType = UIKeyboardTypeDecimalPad;
-        tf.text = [NSString stringWithFormat:@"%.3f", self.interval];
+        tf.placeholder = @"clicks per second (0.1 - 50)"; tf.keyboardType = UIKeyboardTypeDecimalPad;
+        tf.text = [NSString stringWithFormat:@"%.3g", 1.0 / self.interval];
     }];
     [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
         tf.placeholder = @"jitter (px)"; tf.keyboardType = UIKeyboardTypeNumberPad;
         tf.text = [NSString stringWithFormat:@"%ld", (long)self.jitter];
     }];
     [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.placeholder = @"gap between sequential taps (s)"; tf.keyboardType = UIKeyboardTypeDecimalPad;
+        tf.placeholder = @"delay between targets, sequential (s)"; tf.keyboardType = UIKeyboardTypeDecimalPad;
         tf.text = [NSString stringWithFormat:@"%.3f", self.gap];
     }];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"delay between multi-clicks (s)"; tf.keyboardType = UIKeyboardTypeDecimalPad;
+        tf.text = [NSString stringWithFormat:@"%.3f", self.burstGap];
+    }];
     [a addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
-        self.interval = MAX(0.02, a.textFields[0].text.doubleValue);
+        double cps = a.textFields[0].text.doubleValue;
+        if (cps > 0) self.interval = 1.0 / MIN(50.0, MAX(0.1, cps));
         self.jitter = MAX(0, a.textFields[1].text.integerValue);
         self.gap = MAX(0.0, a.textFields[2].text.doubleValue);
+        self.burstGap = MAX(0.01, a.textFields[3].text.doubleValue);
         [self restartIfRunning];
-    }]];
-    [a addAction:[UIAlertAction actionWithTitle:@"Add target" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
-        if (self.targets.count < 10) [self addTarget];
-    }]];
-    [a addAction:[UIAlertAction actionWithTitle:@"Remove last target" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
-        [self removeTarget];
-    }]];
-    [a addAction:[UIAlertAction actionWithTitle:(self.simultaneous ? @"Switch to Sequential" : @"Switch to Simultaneous")
-                                          style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
-        self.simultaneous = !self.simultaneous;
+        [self refreshUI];
     }]];
     [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:a animated:YES completion:nil];
